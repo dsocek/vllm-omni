@@ -234,7 +234,11 @@ def _build_multimodal_output(
     if postprocess_output.metadata:
         mm_output["metadata"] = postprocess_output.metadata
     for key, value in postprocess_output.outputs.items():
-        if key in {"audio", "actions", "trajectory"}:
+        # "latent" lets a producer stage (e.g. the disaggregated Causal-Forcing
+        # DiT stage) hand a raw latent tensor to a downstream stage via the
+        # multimodal_output channel — the payload the inter-stage connector
+        # preserves. The DiT post-process returns {"latent": <tensor>}.
+        if key in {"audio", "actions", "trajectory", "latent"}:
             mm_output[key] = value
     if audio_sample_rate is not None:
         mm_output["audio_sample_rate"] = audio_sample_rate

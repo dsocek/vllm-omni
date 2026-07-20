@@ -306,6 +306,21 @@ _DIFFUSION_MODELS = {
         "pipeline_dreamzero",
         "DreamZeroPipeline",
     ),
+    "CausalForcingPipeline": (
+        "causal_forcing",
+        "pipeline_causal_forcing",
+        "CausalForcingPipeline",
+    ),
+    "CausalForcingDiTPipeline": (
+        "causal_forcing",
+        "pipeline_causal_forcing",
+        "CausalForcingDiTPipeline",
+    ),
+    "CausalForcingVAEPipeline": (
+        "causal_forcing",
+        "pipeline_causal_forcing",
+        "CausalForcingVAEPipeline",
+    ),
     "StableDiffusionXLPipeline": (
         "sdxl",
         "pipeline_sdxl",
@@ -545,6 +560,19 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
+    "CausalForcingPipeline": "get_causal_forcing_post_process_func",
+    # VAE stage produces pixel video → same post-process as the aggregated
+    # pipeline. The DiT stage routes its latent onto the multimodal_output
+    # "latent" channel so it survives the inter-stage connector to the VAE stage.
+    "CausalForcingVAEPipeline": "get_causal_forcing_post_process_func",
+    "CausalForcingDiTPipeline": "get_causal_forcing_dit_post_process_func",
+}
+
+_DIFFUSION_ACTION_POST_PROCESS_FUNCS = {
+    # arch: action_post_process_func
+    # `action_post_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
+    # where mod_folder and mod_relname are defined and mapped using `_DIFFUSION_MODELS` via the `arch` key.
+    "Cosmos3OmniDiffusersPipeline": "get_cosmos3_action_post_process_func",
 }
 
 _DIFFUSION_IR_OP_PRIORITY_FUNCS = {

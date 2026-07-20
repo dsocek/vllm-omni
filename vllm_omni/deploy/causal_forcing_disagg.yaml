@@ -1,0 +1,67 @@
+# Causal-Forcing (framewise-1step) DISAGGREGATED T2V deploy: 2 diffusion stages.
+#
+#   Stage 0 (DiT): text encode + framewise rollout -> video latents.
+#   Stage 1 (VAE): decode latents -> pixels.
+#
+# Topology: vllm_omni/model_executor/models/causal_forcing/pipeline.py
+#   (CAUSAL_FORCING_DISAGG_PIPELINE, registered as "causal_forcing_disagg").
+# The `pipeline:` key below selects it explicitly (model_index.json still says
+# _class_name=CausalForcingPipeline, which would otherwise route to the
+# single-stage fallback).
+#
+# Devices are LOGICAL indices into the launching process's visible set. Launch
+# the whole run masked to the two reserved cards, e.g.
+#   ZE_AFFINITY_MASK=0,2 python examples/.../causal_forcing_disagg.py ...
+# then stage 0 -> physical card 0 and stage 1 -> physical card 2. Nothing
+# touches any other card.
+#
+# async_chunk MUST be false: a 2-diffusion-stage pipeline with inter-stage
+# edges has no async-chunk producer (see merge_pipeline_deploy).
+
+pipeline: causal_forcing_disagg
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  # Stage 0: DiT (text encoder + transformer) -> latents.
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: CausalForcingDiTPipeline
+    parallel_config:
+      tensor_parallel_size: 1
+    # default_sampling_params must exist so the dynamo stage worker applies the
+    # per-request nvext overrides (num_frames/height/width/seed) on top of it;
+    # _build_sampling_params returns None (dropping overrides) when it is empty.
+    default_sampling_params:
+      num_inference_steps: 1
+      num_frames: 81
+      height: 480
+      width: 832
+      fps: 16
+      seed: 42
+    model_config:
+      num_frame_per_block: 1
+      context_noise: 0
+      timestep_shift: 5.0
+      local_attn_size: -1
+      denoising_step_list: [1000]
+      denoising_step_list_first_chunk: [1000, 750, 500, 250]
+      transformer_checkpoint: framewise-1step.pt
+
+  # Stage 1: VAE decode -> pixels.
+  - stage_id: 1
+    devices: "1"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: CausalForcingVAEPipeline
+    parallel_config:
+      tensor_parallel_size: 1
+    default_sampling_params:
+      num_inference_steps: 1
+      num_frames: 81
+      height: 480
+      width: 832
+      fps: 16

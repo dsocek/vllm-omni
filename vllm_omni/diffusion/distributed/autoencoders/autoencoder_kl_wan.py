@@ -45,6 +45,19 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
             return super().encode(x, return_dict=return_dict)
 
     def decode(self, z: torch.Tensor, return_dict: bool = True):
+        # When a spatial_shard_* mode is active, the sharded decode lives in
+        # tiled_decode(); the base _decode() only reaches it via use_tiling +
+        # size threshold. Route directly through tiled_decode so the sharded
+        # path is actually exercised at inference (not just installed at warmup).
+        _split = getattr(self, "_spatial_shard_decode_split_dim", None)
+        if _split is not None:
+            try:
+                _spatial = self._spatial_shard_decode_split_dim() is not None
+            except Exception:
+                _spatial = False
+            if _spatial and z.ndim == 5:
+                with self._execution_context():
+                    return self.tiled_decode(z, return_dict=return_dict)
         with self._execution_context():
             return super().decode(z, return_dict=return_dict)
 

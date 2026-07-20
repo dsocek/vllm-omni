@@ -1,0 +1,29 @@
+# Causal-Forcing (framewise-1step) single-stage T2V deploy (base diffusion engine).
+#
+# The pipeline owns its KV cache (no AR-Diffusion engine). Point MODEL at the
+# assembled model dir produced by
+# examples/offline_inference/causal_forcing/download_causal_forcing.py.
+# The pipeline class is resolved from the model's model_index.json
+# (_class_name=CausalForcingPipeline); see causal_forcing_disagg.yaml for the
+# 2-stage disaggregated (DiT|VAE) variant.
+
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: CausalForcingPipeline
+    parallel_config:
+      tensor_parallel_size: 1
+    model_config:
+      num_frame_per_block: 1
+      context_noise: 0
+      timestep_shift: 5.0
+      local_attn_size: -1
+      denoising_step_list: [1000]
+      denoising_step_list_first_chunk: [1000, 750, 500, 250]
+      transformer_checkpoint: framewise-1step.pt

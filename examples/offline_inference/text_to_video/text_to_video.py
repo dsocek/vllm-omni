@@ -65,6 +65,15 @@ _MODEL_PRESETS = {
         "fps": 16,
         "output": "helios_output.mp4",
     },
+    "causal_forcing": {
+        "height": 480,
+        "width": 832,
+        "num_frames": 81,
+        "num_inference_steps": 1,
+        "guidance_scale": 1.0,
+        "fps": 16,
+        "output": "causal_forcing_output.mp4",
+    },
 }
 
 
@@ -78,6 +87,8 @@ def _detect_preset(model: str) -> dict:
         return _MODEL_PRESETS["hunyuan"]
     if "helios" in model_lower:
         return _MODEL_PRESETS["helios"]
+    if "causal" in model_lower:
+        return _MODEL_PRESETS["causal_forcing"]
     return _MODEL_PRESETS["wan"]
 
 
@@ -276,6 +287,14 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for VAE patch/tile parallelism (decode).",
     )
     parser.add_argument(
+        "--vae-parallel-mode",
+        type=str,
+        default="tile",
+        choices=["tile", "spatial_shard_height", "spatial_shard_width"],
+        help="VAE decode parallel strategy: 'tile' (overlap+blend gather) or "
+        "'spatial_shard_height'/'spatial_shard_width' (halo-exchange feature sharding).",
+    )
+    parser.add_argument(
         "--pipeline-parallel-size",
         type=int,
         default=1,
@@ -360,6 +379,7 @@ def main():
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
         vae_patch_parallel_size=args.vae_patch_parallel_size,
+        vae_parallel_mode=args.vae_parallel_mode,
         pipeline_parallel_size=args.pipeline_parallel_size,
         enable_expert_parallel=args.enable_expert_parallel,
     )
@@ -446,13 +466,24 @@ def main():
     elif extra_body:
         sampling_params.extra_args.update({k: v for k, v in extra_body.items() if v is not None})
 
-    generation_start = time.perf_counter()
-    frames = omni.generate(
-        prompt_dict,
-        sampling_params,
-    )
-    generation_end = time.perf_counter()
-    generation_time = generation_end - generation_start
+    import os as _os
+
+    _n_runs = int(_os.environ.get("CF_BENCH_RUNS", "1"))
+    _e2e_times = []
+    for _run in range(_n_runs):
+        generation_start = time.perf_counter()
+        frames = omni.generate(
+            prompt_dict,
+            sampling_params,
+        )
+        generation_end = time.perf_counter()
+        generation_time = generation_end - generation_start
+        _e2e_times.append(generation_time)
+        _tag = "WARMUP" if (_n_runs > 1 and _run == 0) else f"RUN{_run}"
+        print(f"[CF_E2E] {_tag}: {generation_time:.4f} s ({generation_time * 1000:.2f} ms)", flush=True)
+    if _n_runs > 1:
+        _warm = _e2e_times[1:]
+        print(f"[CF_E2E] warm_avg over {len(_warm)} runs: {sum(_warm) / len(_warm):.4f} s", flush=True)
 
     # Print profiling results
     print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")

@@ -20,6 +20,8 @@ already-loaded decoder.
 from __future__ import annotations
 
 import math
+import os
+import time
 from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -784,6 +786,11 @@ def spatial_shard_decode(
     rank, world_size = _rank_world(group)
     produce_output = world_size <= 1 or rank == 0
 
+    _cf_timer = os.environ.get("CF_VAE_TIMER") == "1"
+    if _cf_timer and rank == 0:
+        logger.info("[CF_MARKER] spatial_shard_decode ENTER z=%s world=%d", tuple(z.shape), world_size)
+        torch.xpu.synchronize()
+        _cf_t0 = time.perf_counter()
     vae.clear_cache()
     try:
         context = vae._execution_context() if hasattr(vae, "_execution_context") else nullcontext()
@@ -811,6 +818,15 @@ def spatial_shard_decode(
     finally:
         vae.clear_cache()
 
+    if _cf_timer and rank == 0:
+        torch.xpu.synchronize()
+        logger.info(
+            "[CF_VAE_TIMER] spatial_shard_decode: %.1f ms (world=%d, latent_frames=%d, split=%s)",
+            (time.perf_counter() - _cf_t0) * 1000,
+            world_size,
+            z.shape[2],
+            split_dim,
+        )
     if not return_dict:
         return (out,)
     return DecoderOutput(sample=out)
