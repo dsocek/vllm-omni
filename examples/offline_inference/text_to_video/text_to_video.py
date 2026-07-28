@@ -295,6 +295,16 @@ def parse_args() -> argparse.Namespace:
         "'spatial_shard_height'/'spatial_shard_width' (halo-exchange feature sharding).",
     )
     parser.add_argument(
+        "--local-attn-size",
+        type=int,
+        default=None,
+        help="(Causal-Forcing) Sliding-window causal attention size, in latent frames. "
+        "-1 = full global attention, which caps a clip at 21 latent frames (81 video "
+        "frames) at 480x832. A finite window gives constant KV memory and a flat "
+        "per-latent cost, required for longer streaming clips. Default: the model's "
+        "model_index.json value.",
+    )
+    parser.add_argument(
         "--pipeline-parallel-size",
         type=int,
         default=1,
@@ -417,6 +427,14 @@ def main():
     # gate is an engine-level config (offline analog of the server's --no-guardrails).
     if args.extra_body and "guardrails" in args.extra_body:
         omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
+
+    # (Causal-Forcing) Sliding-window attention size. Merged into model_config so
+    # it overrides the model_index.json value for just this key.
+    if args.local_attn_size is not None:
+        omni_kwargs["model_config"] = {
+            **omni_kwargs.get("model_config", {}),
+            "local_attn_size": args.local_attn_size,
+        }
 
     omni = Omni(**omni_kwargs)
     model_class_name = get_model_class_name(omni) or model_class_name

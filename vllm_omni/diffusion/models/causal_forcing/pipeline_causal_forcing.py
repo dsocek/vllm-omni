@@ -15,6 +15,7 @@ is owned by this pipeline. See :mod:`.causal_wan_model` for the transformer and
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import Iterable
@@ -81,6 +82,23 @@ TRANSFORMER_CONFIG = {
 GLOBAL_KV_CACHE_SIZE = 32760
 
 
+def _read_model_index(model: str) -> dict:
+    """Read the assembled model's ``model_index.json`` inference constants.
+
+    The engine reads that file only for ``_class_name``, so on the offline path
+    the checkpoint's own constants never reach ``od_config.model_config``. Best
+    effort: a missing or malformed file just means "no overrides".
+    """
+    path = os.path.join(model, "model_index.json")
+    try:
+        with open(path) as f:
+            index = json.load(f)
+    except (OSError, ValueError) as e:
+        logger.debug("CausalForcing: no usable model_index.json at %s (%s)", path, e)
+        return {}
+    return index if isinstance(index, dict) else {}
+
+
 class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscovery):
     """Causal-Forcing text-to-video pipeline (few-step, KV-cached, base engine).
 
@@ -121,7 +139,14 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
 
         model = od_config.model
         local_files_only = os.path.exists(model)
-        model_config = od_config.model_config or {}
+        # Inference constants come from the model's own ``model_index.json``,
+        # with deploy/engine ``model_config`` overriding per key. The engine reads
+        # that file only for ``_class_name`` and never populates
+        # ``od_config.model_config`` on the offline path, so without this merge the
+        # checkpoint's constants (notably ``local_attn_size``) are unreachable
+        # there — and a partial engine-side ``model_config`` must not silently
+        # drop the rest of them.
+        model_config = {**_read_model_index(model), **(od_config.model_config or {})}
 
         # ---- Inference constants (model_index.json / model_config overrides) ----
         self.num_frame_per_block = int(model_config.get("num_frame_per_block", DEFAULT_NUM_FRAME_PER_BLOCK))
@@ -132,7 +157,16 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
         denoising_step_list_first_chunk = model_config.get(
             "denoising_step_list_first_chunk", DEFAULT_DENOISING_STEP_LIST_FIRST_CHUNK
         )
+        # Sliding-window causal attention. ``-1`` means full global attention,
+        # which caps a clip at ``GLOBAL_KV_CACHE_SIZE`` tokens (21 latent frames
+        # at 480x832); a finite window gives constant KV memory and a flat
+        # per-latent cost, which is what streaming beyond that cap needs.
+        # ``CF_LOCAL_ATTN_SIZE`` is a debug/benchmark escape hatch only.
         local_attn_size = int(model_config.get("local_attn_size", TRANSFORMER_CONFIG["local_attn_size"]))
+        _env_attn = os.environ.get("CF_LOCAL_ATTN_SIZE")
+        if _env_attn is not None:
+            local_attn_size = int(_env_attn)
+            logger.info("CausalForcing: local_attn_size=%d (CF_LOCAL_ATTN_SIZE override)", local_attn_size)
 
         # ---- Scheduler + warped denoising schedules ----
         self.scheduler = FlowMatchScheduler(
@@ -458,6 +492,10 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
         # (no VAE work here — the VAE isn't even built in this role).
         if self._stage_role == "dit":
             output_type = "latent"
+        # Benchmark knob: emit raw latents and skip VAE decode entirely (no
+        # denorm, no decoder) so a run measures pure DiT rollout throughput.
+        if os.environ.get("CF_DIT_ONLY") == "1":
+            output_type = "latent"
 
         # Latent geometry: VAE downsamples 8x spatial, 4x temporal (+1).
         latent_h = height // 8
@@ -498,6 +536,20 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
         # KV pool: for local attention, a bounded window; for global attention,
         # only as large as the full clip needs (capped by the upstream default).
         if self.transformer.local_attn_size == -1:
+            # Global attention cannot address more than GLOBAL_KV_CACHE_SIZE
+            # tokens. Past that the KV window would be silently clamped and the
+            # attention slice collapses to width 0 deep in the attention call,
+            # so fail here with something actionable instead.
+            if latent_frames * frame_seqlen > GLOBAL_KV_CACHE_SIZE:
+                max_latents = GLOBAL_KV_CACHE_SIZE // frame_seqlen
+                raise ValueError(
+                    f"Global attention (local_attn_size=-1) supports at most {max_latents} latent frames "
+                    f"at {height}x{width} ({GLOBAL_KV_CACHE_SIZE}-token KV pool / {frame_seqlen} tokens per "
+                    f"frame), but this request needs {latent_frames} (num_frames={num_frames}). "
+                    f"Set a finite sliding window — local_attn_size <= {max_latents} in the deploy "
+                    f"model_config or the model's model_index.json — for constant-memory streaming "
+                    f"beyond that length."
+                )
             kv_cache_size = min(GLOBAL_KV_CACHE_SIZE, latent_frames * frame_seqlen)
         else:
             kv_cache_size = self.transformer.local_attn_size * frame_seqlen
