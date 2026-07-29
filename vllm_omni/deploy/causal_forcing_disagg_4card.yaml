@@ -1,0 +1,65 @@
+# Causal-Forcing (framewise-1step) DISAGGREGATED T2V deploy, 4-CARD variant.
+#
+#   Stage 0 (DiT): text encode + framewise rollout -> video latents   [card 0     ]
+#   Stage 1 (VAE): spatially-sharded decode -> pixels                 [all 4 cards]
+#
+# Devices are LOGICAL indices into the launching process's visible set. Launch
+# masked to the four cards, e.g.
+#   ZE_AFFINITY_MASK=0,2,4,6 ...
+# then stage 0 -> physical card 0 and stage 1 -> physical cards 0,2,4,6.
+#
+# vae_patch_parallel_size MUST equal the stage's tensor_parallel_size (the
+# shard group is the stage's TP group). Latent height splits evenly across ranks.
+#
+# async_chunk MUST be false: a 2-diffusion-stage pipeline with inter-stage
+# edges has no async-chunk producer (see merge_pipeline_deploy).
+
+pipeline: causal_forcing_disagg
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  # Stage 0: DiT (text encoder + transformer) -> latents
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: CausalForcingDiTPipeline
+    parallel_config:
+      tensor_parallel_size: 1
+    # default_sampling_params must exist so the dynamo stage worker applies the
+    # per-request nvext overrides (num_frames/height/width/seed) on top of it;
+    # _build_sampling_params returns None (dropping overrides) when it is empty.
+    default_sampling_params:
+      num_inference_steps: 1
+      num_frames: 81
+      height: 480
+      width: 832
+      fps: 16
+      seed: 42
+    model_config:
+      num_frame_per_block: 1
+      context_noise: 0
+      timestep_shift: 5.0
+      local_attn_size: -1
+      denoising_step_list: [1000]
+      denoising_step_list_first_chunk: [1000, 750, 500, 250]
+      transformer_checkpoint: framewise-1step.pt
+
+  # Stage 1: spatial-parallel VAE decode -> pixels
+  - stage_id: 1
+    devices: "0,1,2,3"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: CausalForcingVAEPipeline
+    parallel_config:
+      tensor_parallel_size: 4
+      vae_patch_parallel_size: 4
+      vae_parallel_mode: spatial_shard_height
+    default_sampling_params:
+      num_inference_steps: 1
+      num_frames: 81
+      height: 480
+      width: 832
+      fps: 16

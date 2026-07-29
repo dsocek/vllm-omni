@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """CausalForcingPipeline — vllm-omni pipeline for thu-ml/Causal-Forcing.
+Adapted from https://github.com/thu-ml/Causal-Forcing (pipeline/causal_inference.py).
 
 Wan2.1-T2V-1.3B-based causal / autoregressive few-step video diffusion. Video
 latents are generated block-by-block (``num_frame_per_block``) with a
@@ -42,14 +43,6 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = logging.getLogger(__name__)
-
-# Default WAN 1.3B negative prompt (unused when CFG is off, kept for parity).
-DEFAULT_NEGATIVE_PROMPT = (
-    "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，"
-    "整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，"
-    "画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，"
-    "静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
-)
 
 # framewise-1step defaults (configs/causal_forcing_dmd_framewise_1step.yaml).
 DEFAULT_DENOISING_STEP_LIST = [1000]
@@ -151,7 +144,6 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
         # ---- Inference constants (model_index.json / model_config overrides) ----
         self.num_frame_per_block = int(model_config.get("num_frame_per_block", DEFAULT_NUM_FRAME_PER_BLOCK))
         self.context_noise = int(model_config.get("context_noise", DEFAULT_CONTEXT_NOISE))
-        self.negative_prompt = model_config.get("negative_prompt", DEFAULT_NEGATIVE_PROMPT)
         timestep_shift = float(model_config.get("timestep_shift", DEFAULT_TIMESTEP_SHIFT))
         denoising_step_list = model_config.get("denoising_step_list", DEFAULT_DENOISING_STEP_LIST)
         denoising_step_list_first_chunk = model_config.get(
@@ -678,12 +670,6 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
             output = torch.cat(denoised_latents, dim=2)  # [B, C, latent_frames, H, W]
             if _cf_stage:
                 logger.info("[CF_STAGE] (dit-stage) latents=%d DiT=%.1fms", len(denoised_latents), _cf_dit_ms)
-            # Disaggregated DiT stage: also expose the latents on custom_output so
-            # the dit2vae bridge reads them from an explicit channel (the default
-            # ``.images[0]`` packaging works too, but custom_output survives the
-            # ZMQ hop untouched and is unambiguous).
-            if self._stage_role == "dit":
-                return DiffusionOutput(output=output, custom_output={"latents": output})
         elif stream_decode:
             # Concatenate the per-chunk streaming-decoded video along the time axis.
             output = torch.cat(decoded_chunks, dim=2)  # [B, C, T_video, H, W]
@@ -888,10 +874,12 @@ class CausalForcingDiTPipeline(CausalForcingPipeline):
     """Stage 0 of the disaggregated Causal-Forcing pipeline (DiT only).
 
     Builds the text encoder + transformer, runs the framewise rollout, and
-    emits raw model-space latents (on ``output`` and ``custom_output['latents']``).
-    Registered as a distinct model arch with **no** post-process func, so the
-    latent tensor is carried to the VAE stage untouched (a registered
-    post-process would convert it to pixels — see ``get_..._post_process_func``).
+    emits raw model-space latents on ``output``. Registered as a distinct model
+    arch so it gets its own post-process func
+    (``get_causal_forcing_dit_post_process_func``), which routes the latent onto
+    ``multimodal_output['latent']`` (the channel the inter-stage connector
+    preserves) instead of decoding it to pixels the way the aggregated
+    pipeline's post-process would.
     """
 
     _stage_role: ClassVar[str] = "dit"

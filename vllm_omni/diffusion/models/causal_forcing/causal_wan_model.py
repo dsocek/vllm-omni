@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """CausalWanModel — causal Wan2.1 DiT with a dict-based KV cache.
+Adapted from https://github.com/thu-ml/Causal-Forcing (wan/modules/causal_model.py,
+pipeline/causal_inference.py).
 
 Port of thu-ml/Causal-Forcing (``causal-forcing++/framewise-1step``), a
 Wan2.1-T2V-1.3B-based causal / autoregressive few-step video diffusion model.
@@ -15,9 +17,6 @@ this model uses the upstream repo's dict-based KV cache
 (``{k, v, global_end_index, local_end_index}`` per layer) so the clean-context
 refresh pass (rerun at ``context_noise``) can OVERWRITE the current block's K/V
 slots in place — the mechanism few-step Causal Forcing relies on.
-
-Reference: CausVid Algorithm 2 (https://arxiv.org/abs/2412.07772) and
-Causal-Forcing ``wan/modules/causal_model.py`` / ``pipeline/causal_inference.py``.
 """
 
 from __future__ import annotations
@@ -41,7 +40,9 @@ from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_omni.diffusion.attention.layer import Attention
 
-# ── RoPE utilities ──────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# RoPE utilities
+# ---------------------------------------------------------------------------
 
 
 def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
@@ -84,7 +85,9 @@ def rope_apply(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     return x
 
 
-# ── Normalization ───────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Normalization
+# ---------------------------------------------------------------------------
 
 
 class WanLayerNorm(nn.LayerNorm):
@@ -181,7 +184,9 @@ def fused_qk_rms_norm(
     return q_out, k_out
 
 
-# ── Cross-Attention (text-to-video) ─────────────────────────────────
+# ---------------------------------------------------------------------------
+# Cross-Attention (text-to-video)
+# ---------------------------------------------------------------------------
 
 
 class WanT2VCrossAttention(nn.Module):
@@ -244,7 +249,9 @@ class WanT2VCrossAttention(nn.Module):
         return x
 
 
-# ── Self-Attention with causal masking + dict KV cache ──────────────
+# ---------------------------------------------------------------------------
+# Self-Attention with causal masking + dict KV cache
+# ---------------------------------------------------------------------------
 
 
 class CausalWanSelfAttention(nn.Module):
@@ -369,7 +376,9 @@ class CausalWanSelfAttention(nn.Module):
         return x
 
 
-# ── Attention Block ─────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Attention Block
+# ---------------------------------------------------------------------------
 
 
 class CausalWanAttentionBlock(nn.Module):
@@ -438,7 +447,9 @@ class CausalWanAttentionBlock(nn.Module):
         return x
 
 
-# ── Output Head ─────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Output Head
+# ---------------------------------------------------------------------------
 
 
 class CausalHead(nn.Module):
@@ -461,7 +472,9 @@ class CausalHead(nn.Module):
         return x
 
 
-# ── Main Model ──────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Main Model
+# ---------------------------------------------------------------------------
 
 
 class CausalWanModel(nn.Module):
