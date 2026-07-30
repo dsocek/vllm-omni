@@ -626,12 +626,10 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
             output = torch.cat(denoised_latents, dim=2)  # [B, C, latent_frames, H, W]
             if _cf_stage:
                 logger.info("[CF_STAGE] (dit-stage) latents=%d DiT=%.1fms", len(denoised_latents), _cf_dit_ms)
-            # Disaggregated DiT stage: also expose the latents on custom_output so
-            # the dit2vae bridge reads them from an explicit channel (the default
-            # ``.images[0]`` packaging works too, but custom_output survives the
-            # ZMQ hop untouched and is unambiguous).
+            # Disaggregated DiT stage: return the latents as the single output
+            # channel; the dit2vae bridge reads them from ``.images[0]``.
             if self._stage_role == "dit":
-                return DiffusionOutput(output=output, custom_output={"latents": output})
+                return DiffusionOutput(output=output)
         elif stream_decode:
             # Concatenate the per-chunk streaming-decoded video along the time axis.
             output = torch.cat(decoded_chunks, dim=2)  # [B, C, T_video, H, W]
