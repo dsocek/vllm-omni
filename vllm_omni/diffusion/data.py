@@ -784,6 +784,11 @@ class OmniDiffusionConfig:
 
     # Streaming mode settings
     streaming_output: bool = False  # Start (video) generation with initial prompt, but streaming output in chunks
+    # DiT block-stream lane: stream each rollout block out of the worker as it is
+    # produced, over the existing result_mq, without swapping to step execution.
+    # Requires streaming_output=True and a pipeline whose forward accepts an
+    # on_block hook (CausalForcing DiT). Keeps the RequestScheduler.
+    stream_dit_blocks: bool = False
 
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1

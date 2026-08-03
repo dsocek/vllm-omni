@@ -32,6 +32,12 @@ stages:
     model_class_name: CausalForcingDiTPipeline
     parallel_config:
       tensor_parallel_size: 1
+    # Live CMAF streaming (work-item c): stream each rollout block out of the
+    # worker as it is produced (over result_mq, keeping RequestScheduler — no
+    # step execution). Harmless for the batch path; the dynamo worker only takes
+    # the per-chunk lane when non-terminal blocks arrive.
+    streaming_output: true
+    stream_dit_blocks: true
     # default_sampling_params must exist so the dynamo stage worker applies the
     # per-request nvext overrides (num_frames/height/width/seed) on top of it;
     # _build_sampling_params returns None (dropping overrides) when it is empty.
@@ -59,6 +65,12 @@ stages:
     model_class_name: CausalForcingVAEPipeline
     parallel_config:
       tensor_parallel_size: 1
+    # Live CMAF streaming (work-item c): stream each decoded pixel frame out of
+    # the VAE worker as it is produced (feat_cache persisted across frames →
+    # seam-free), symmetric to the DiT block-stream lane. The dynamo worker
+    # routes these final-stage pixel chunks to the router via per-chunk SHM.
+    streaming_output: true
+    stream_dit_blocks: true
     default_sampling_params:
       num_inference_steps: 1
       num_frames: 81

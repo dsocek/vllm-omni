@@ -348,6 +348,54 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         return BatchRunnerOutput.from_list(runner_outputs)
 
+    def execute_request_stream(self, scheduler_output: DiffusionSchedulerOutput):
+        """DiT block-stream lane: yield one RunnerOutput per rollout block.
+
+        Broadcasts a single ``execute_model`` RPC flagged ``stream_blocks=True``
+        (the worker then enqueues each block to result_mq via its on_block hook),
+        then drains result_mq until the terminal ``finished=True`` reply. Unlike
+        collective_rpc's one-reply contract, this reads N intermediate blocks +
+        the sentinel for one request. Request-mode only (one request per wave).
+        """
+        from vllm_omni.diffusion.worker.utils import RunnerOutput
+
+        self._ensure_open()
+        new_reqs = scheduler_output.scheduled_new_reqs
+        if len(new_reqs) != 1:
+            raise RuntimeError(f"execute_request_stream expects exactly one request, got {len(new_reqs)}.")
+        new_req = new_reqs[0]
+
+        rpc_request = {
+            "type": "rpc",
+            "method": "execute_model",
+            "args": (new_req.req, self.od_config, scheduler_output.kv_prefetch_jobs),
+            "kwargs": {},
+            "output_rank": 0,
+            "exec_all_ranks": True,
+            "collect_rank_status": False,
+            "stream_blocks": True,
+        }
+        self._broadcast_mq.enqueue(rpc_request)
+
+        while True:
+            response = self._dequeue_one_with_failure_polling(None, "execute_model")
+            try:
+                unpack_diffusion_output_shm(response)
+            except Exception as e:
+                logger.warning("SHM unpack failed (data may already be inline): %s", e)
+            response = MultiprocDiffusionExecutor._handle_rpc_response(response)
+            if not isinstance(response, DiffusionOutput):
+                raise RuntimeError(f"Unexpected streamed response type: {type(response)!r}")
+            finished = bool(response.finished)
+            yield RunnerOutput(
+                request_id=new_req.request_id,
+                step_index=None,
+                finished=finished,
+                result=response,
+            )
+            if finished:
+                break
+
     def execute_batch(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute request-mode work through a single batched worker RPC.
 

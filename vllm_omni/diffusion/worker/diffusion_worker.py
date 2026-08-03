@@ -417,8 +417,14 @@ class DiffusionWorker:
         req: OmniDiffusionRequest,
         od_config: OmniDiffusionConfig,
         kv_prefetch_jobs: dict | None = None,
+        on_block=None,
     ) -> DiffusionOutput:
-        """Execute a forward pass by delegating to the model runner."""
+        """Execute a forward pass by delegating to the model runner.
+
+        ``on_block`` (DiT block-stream hook) is threaded to the runner unchanged;
+        it is set by the streaming lane in WorkerProc so each rollout block is
+        enqueued to result_mq the moment it is produced.
+        """
         assert self.model_runner is not None, "Model runner not initialized"
         if self.lora_manager is not None:
             try:
@@ -430,7 +436,7 @@ class DiffusionWorker:
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
         with ctx:
-            output = self.model_runner.execute_model(req, kv_prefetch_jobs=kv_prefetch_jobs)
+            output = self.model_runner.execute_model(req, kv_prefetch_jobs=kv_prefetch_jobs, on_block=on_block)
         if profiler:
             profiler.step()
         return output
@@ -848,6 +854,12 @@ class WorkerProc:
         output_rank = rpc_request.get("output_rank")
         exec_all_ranks = rpc_request.get("exec_all_ranks", False)
         collect_rank_status = rpc_request.get("collect_rank_status", False)
+
+        # DiT block-stream lane: enqueue each rollout block to result_mq as it is
+        # produced. return_result no-ops on non-rank-0 workers (no result_mq), so
+        # only rank 0 streams; the terminal sentinel rides the normal reply below.
+        if rpc_request.get("stream_blocks") and method == "execute_model":
+            kwargs = {**kwargs, "on_block": self.return_result}
 
         if collect_rank_status and not exec_all_ranks:
             raise ValueError("collect_rank_status requires exec_all_ranks=True so all ranks enter the status gather")

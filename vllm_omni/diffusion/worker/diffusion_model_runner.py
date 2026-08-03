@@ -213,7 +213,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         )
         logger.info("Model runner: Model loaded successfully.")
 
-        if self.od_config.streaming_output and not getattr(self.od_config, "step_execution", False):
+        # The DiT block-stream lane streams over the RequestScheduler via an
+        # on_block hook, so it does NOT need step execution. Only force / require
+        # step mode for streaming_output when that lane is not the one in use.
+        stream_dit_blocks = bool(getattr(self.od_config, "stream_dit_blocks", False))
+
+        if (
+            self.od_config.streaming_output
+            and not getattr(self.od_config, "step_execution", False)
+            and not stream_dit_blocks
+        ):
             logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
             self.od_config.step_execution = True
 
@@ -223,7 +232,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
-        if self.od_config.streaming_output and not self.supports_step_mode():
+        if self.od_config.streaming_output and not stream_dit_blocks and not self.supports_step_mode():
             raise ValueError(
                 "streaming_output=True requires step execution support; "
                 f"{self.od_config.model_class_name} does not support that contract."
@@ -434,6 +443,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         require_request_batch_support: bool,
         kv_prefetch_jobs: dict | None = None,
         record_name: str,
+        on_block=None,
     ) -> BatchRunnerOutput:
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         if not reqs:
@@ -467,7 +477,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=od_config):
                 with record_function(record_name):
-                    raw_outputs = self.pipeline.forward(batch)
+                    # on_block (DiT block-stream hook) is only threaded through
+                    # by the single-request execute_model path, and only for
+                    # pipelines whose forward accepts it (e.g. CausalForcing DiT).
+                    forward_kwargs = {"on_block": on_block} if on_block is not None else {}
+                    raw_outputs = self.pipeline.forward(batch, **forward_kwargs)
                     outputs = _normalize_pipeline_outputs(
                         raw_outputs,
                         expected_count=len(reqs),
@@ -508,7 +522,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         )
         attach_stage_durations(state, output)
 
-    def execute_model(self, req: OmniDiffusionRequest, kv_prefetch_jobs: dict | None = None) -> DiffusionOutput:
+    def execute_model(
+        self, req: OmniDiffusionRequest, kv_prefetch_jobs: dict | None = None, on_block=None
+    ) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
 
@@ -531,6 +547,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             require_request_batch_support=False,
             kv_prefetch_jobs=kv_prefetch_jobs,
             record_name="pipeline_forward",
+            on_block=on_block,
         )
         output = runner_output.runner_outputs[0].result
         assert output is not None

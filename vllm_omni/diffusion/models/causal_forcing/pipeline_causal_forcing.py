@@ -435,11 +435,17 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
     # -----------------------------------------------------------------------
 
     @torch.no_grad()
-    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch, *, on_block=None) -> DiffusionOutput:
+        # ``on_block`` (keyword-only) is the DiT block-stream hook: when set, it
+        # is called once per rollout block with an intermediate DiffusionOutput
+        # (finished=False) carrying that block's raw latents, so the disaggregated
+        # DiT stage can stream chunks the moment they are produced. It fires
+        # in-worker (see WorkerProc), and the aggregated terminal output is still
+        # returned. ``on_block=None`` (the default) is the untouched batch path.
         # VAE stage of the disaggregated pipeline: no rollout, just decode the
         # latents handed over from the DiT stage.
         if self._stage_role == "vae":
-            return self._forward_vae_decode(req)
+            return self._forward_vae_decode(req, on_block=on_block)
 
         if len(req.prompts) != 1:
             raise ValueError("CausalForcingPipeline supports a single prompt per request.")
@@ -608,6 +614,22 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
                     crossattn_cache=crossattn_cache,
                 )
 
+                # DiT block-stream hook: emit this block's latents now. The
+                # clean-context refresh above only rewrites *this* block's K/V
+                # slots (current_start unchanged), so denoised_pred is final and
+                # safe to hand off. The block rides as .output, mirroring the
+                # aggregated latent path so the downstream VAE stage reads it the
+                # same way. finished=False marks it as non-terminal.
+                if on_block is not None:
+                    on_block(
+                        DiffusionOutput(
+                            output=denoised_pred,
+                            finished=False,
+                            chunk_index=block_index,
+                            total_chunks=num_blocks,
+                        )
+                    )
+
                 current_start_frame += nfpb
                 progress_bar.update()
 
@@ -623,6 +645,14 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
             len(denoised_latents),
         )
         if output_type == "latent":
+            # DiT block-stream lane: every block's latents already went out via
+            # on_block (finished=False). The terminal is a bare finished=True
+            # sentinel — no payload — so the consumer is not handed the whole
+            # clip a second time.
+            if on_block is not None and self._stage_role == "dit":
+                if _cf_stage:
+                    logger.info("[CF_STAGE] (dit-stage, streamed) blocks=%d DiT=%.1fms", num_blocks, _cf_dit_ms)
+                return DiffusionOutput(output=None, finished=True)
             output = torch.cat(denoised_latents, dim=2)  # [B, C, latent_frames, H, W]
             if _cf_stage:
                 logger.info("[CF_STAGE] (dit-stage) latents=%d DiT=%.1fms", len(denoised_latents), _cf_dit_ms)
@@ -675,7 +705,7 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
     # -----------------------------------------------------------------------
 
     @torch.no_grad()
-    def _forward_vae_decode(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+    def _forward_vae_decode(self, req: DiffusionRequestBatch, *, on_block=None) -> DiffusionOutput:
         """Decode DiT-stage latents to pixels (stage 1 of the disaggregated run).
 
         The latent tensor rides in the request prompt dict under
@@ -684,6 +714,15 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
         ``prior_token_ids`` contract for direct-API callers). Latents are the
         raw model-space output of the DiT rollout, so denorm happens here — the
         same math the aggregated pipeline applies before decode.
+
+        ``on_block`` (keyword-only) is the VAE pixel-stream hook, symmetric to
+        the DiT block-stream lane: when set on the single-card streaming path, it
+        fires once per decoded latent frame with an intermediate DiffusionOutput
+        (finished=False) carrying that frame's pixels, so the router can push CMAF
+        segments live. The temporal ``feat_cache`` is persisted across frames
+        exactly as the aggregated stream does, so the emitted pixels are seam-free
+        and byte-identical to the whole-clip decode. ``on_block=None`` is the
+        untouched aggregated path.
         """
         if len(req.prompts) != 1:
             raise ValueError("CausalForcingPipeline (VAE stage) supports a single prompt per request.")
@@ -747,9 +786,31 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
             # frames — seam-free, identical to the aggregated streaming path.
             self._decode_stream_begin()
             num_latent_frames = latents.shape[2]
-            decoded_chunks = [self._decode_stream_step(latents[:, :, i : i + 1]) for i in range(num_latent_frames)]
+            decoded_chunks = []
+            for i in range(num_latent_frames):
+                pixels = self._decode_stream_step(latents[:, :, i : i + 1])
+                decoded_chunks.append(pixels)
+                # VAE pixel-stream hook: emit this frame's pixels the moment they
+                # are decoded. The feat_cache carried by _decode_stream_step keeps
+                # the stream seam-free, so a streamed frame is byte-identical to
+                # its slice of the whole-clip output. finished=False marks it
+                # non-terminal (mirrors the DiT on_block lane).
+                if on_block is not None:
+                    on_block(
+                        DiffusionOutput(
+                            output=pixels,
+                            finished=False,
+                            chunk_index=i,
+                            total_chunks=num_latent_frames,
+                        )
+                    )
             output = torch.cat(decoded_chunks, dim=2)
             self._decode_stream_end()
+            # Streamed lane: every frame already went out via on_block. Return a
+            # bare terminal sentinel (no payload) so the consumer is not handed
+            # the whole clip a second time — same contract as the DiT lane.
+            if on_block is not None:
+                return DiffusionOutput(output=None, finished=True)
         else:
             # Whole-clip decode (spatial-shard when vae_pp>1); denorm here.
             _denormed = self._denorm_latents(latents)

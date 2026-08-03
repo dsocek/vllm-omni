@@ -160,7 +160,12 @@ class DiffusionEngine:
         self._post_process_accepts_sampling_params = _func_accepts_parameter(self.post_process_func, "sampling_params")
 
         self.step_execution = bool(getattr(od_config, "step_execution", False))
-        if self.od_config.streaming_output and not self.step_execution:
+        # DiT block-stream lane streams blocks over result_mq under the
+        # RequestScheduler, so it must NOT be forced onto the step-execution
+        # path (CausalForcing has no step protocol). Any other streaming_output
+        # pipeline keeps the historical requirement.
+        self.stream_dit_blocks = bool(getattr(od_config, "stream_dit_blocks", False))
+        if self.od_config.streaming_output and not self.step_execution and not self.stream_dit_blocks:
             logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
             self.od_config.step_execution = True
             self.step_execution = True
@@ -371,6 +376,14 @@ class DiffusionEngine:
                     self._handle_finished_requests(sched_output.finished_req_ids, None)
                 continue
 
+            # DiT block-stream lane: one execute_request_stream call yields N
+            # block RunnerOutputs + a terminal, each pushed to the streaming
+            # queue as it arrives. Kept separate from the single-result
+            # execute_fn path below.
+            if self.stream_dit_blocks:
+                self._run_dit_block_stream(sched_output)
+                continue
+
             try:
                 runner_output: BaseRunnerOutput = self.execute_fn(sched_output)  # pyright: ignore[reportAssignmentType]
             except Exception as exc:
@@ -403,6 +416,48 @@ class DiffusionEngine:
 
         # Engine is stopping: fail any RPCs still queued so callers don't hang.
         self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
+
+    def _run_dit_block_stream(self, sched_output) -> None:
+        """Drive the DiT block-stream lane for one scheduled request.
+
+        ``execute_request_stream`` yields one RunnerOutput per rollout block
+        (finished=False) then a terminal (finished=True). Each non-terminal
+        block is delivered to the streaming queue immediately; the terminal
+        drives ``update_from_output`` so the scheduler finalizes the request,
+        matching the step-streaming delivery contract.
+        """
+        request_id = sched_output.scheduled_request_ids[0]
+        try:
+            for runner_output in self.executor.execute_request_stream(sched_output):
+                self._process_aborts_queue()
+                self._process_rpc_queue()
+                if not runner_output.finished:
+                    # Non-terminal block: deliver its result straight away.
+                    if runner_output.result is not None:
+                        self._put_streaming_output_with_cv(request_id, runner_output.result)
+                    continue
+                # Terminal sentinel: let the scheduler mark the request finished,
+                # then flush the finished output (mirrors the step path).
+                finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
+                self._handle_step_streaming_runner_output(
+                    finished_req_ids,
+                    sched_output.scheduled_request_ids,
+                    runner_output,
+                )
+        except Exception as exc:
+            logger.error("DiT block-stream failed for %s", request_id, exc_info=True)
+            terminal = RunnerOutput(
+                request_id=request_id,
+                step_index=None,
+                finished=True,
+                result=DiffusionOutput.from_exception(exc),
+            )
+            finished_req_ids = self.scheduler.update_from_output(sched_output, terminal)
+            self._handle_step_streaming_runner_output(
+                finished_req_ids,
+                sched_output.scheduled_request_ids,
+                terminal,
+            )
 
     def _wait_for_request_batch_admission_locked(self) -> None:
         """Wait for compatible requests to accumulate before scheduling a wave.
