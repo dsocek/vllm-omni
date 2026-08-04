@@ -291,15 +291,21 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
             return "height"
         return None
 
-    def _spatial_shard_decode_enabled(self, z: torch.Tensor) -> bool:
+    def spatial_shard_decode_split_dim_if_ready(self) -> str | None:
+        """The split dimension for sharded decode, or None if it is not usable.
+
+        Tensor-free on purpose. A caller that decodes frame by frame has to know
+        whether sharding is available *before* it has a tensor to decode — it must
+        install the decoder patch once and then keep every rank in lockstep for the
+        whole stream, since one rank skipping a chunk would hang the others in a
+        halo exchange. Sharing this predicate with :meth:`tiled_decode` is what keeps
+        the two entry points from disagreeing about whether sharding is on.
+        """
         split_dim = self._spatial_shard_decode_split_dim()
         if split_dim is None:
-            return False
-        if z.ndim != 5:
-            logger.warning("Wan VAE spatial sharded decode expects 5D latent input; falling back to tiled decode.")
-            return False
+            return None
         if not self.is_distributed_enabled():
-            return False
+            return None
 
         group = self.distributed_executor.group
         world_size = dist.get_world_size(group=group)
@@ -313,8 +319,14 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
                 world_size,
                 split_dim,
             )
+            return None
+        return split_dim
+
+    def _spatial_shard_decode_enabled(self, z: torch.Tensor) -> bool:
+        if self._spatial_shard_decode_split_dim() is not None and z.ndim != 5:
+            logger.warning("Wan VAE spatial sharded decode expects 5D latent input; falling back to tiled decode.")
             return False
-        return True
+        return self.spatial_shard_decode_split_dim_if_ready() is not None
 
     def tiled_decode(self, z: torch.Tensor, return_dict: bool = True):
         if not self.is_distributed_enabled():

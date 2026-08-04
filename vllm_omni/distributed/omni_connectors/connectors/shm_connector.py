@@ -98,7 +98,14 @@ class SharedMemoryConnector(OmniConnectorBase):
             return None
         finally:
             # If data has been received, delete lock_file.
-            if obj and os.path.exists(lock_file):
+            #
+            # "is not None", not truthiness: a payload may be a bare torch.Tensor, and
+            # bool() on a multi-element tensor raises "Boolean value of Tensor with
+            # more than one value is ambiguous". Raising here would be bad enough, but
+            # it happens in a finally block, so it also replaces whatever this method
+            # was about to return. Stage payloads used to be dicts, which are safely
+            # truthy; a Causal-Forcing stream puts the latent tensor itself.
+            if obj is not None and os.path.exists(lock_file):
                 os.remove(lock_file)
 
     def _get_by_key(self, get_key: str) -> tuple[Any, int] | None:

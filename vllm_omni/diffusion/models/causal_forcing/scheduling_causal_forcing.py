@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """FlowMatchScheduler for Causal-Forcing few-step inference.
+Adapted from https://github.com/thu-ml/Causal-Forcing (utils/scheduler.py).
 
 Faithful port of the flow-matching scheduler from thu-ml/Causal-Forcing
 (``utils/scheduler.py``). The framewise inference loop never calls ``step`` —

@@ -34,9 +34,47 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _fold_flat_parallel_kwargs(normalized: dict[str, Any]) -> None:
+    """Fold flat parallel kwargs into the nested ``parallel_config`` mapping.
+
+    ``OmniDiffusionConfig`` carries parallelism only as a nested
+    ``parallel_config``, and ``from_kwargs`` filters to declared fields -- so a
+    flat ``tensor_parallel_size: 2`` from a stage YAML was silently dropped and
+    the stage came up with a default (all-ones) parallel config. CLI overrides
+    never hit this, because ``_apply_diffusion_parallel_runtime_overrides``
+    already nests them; only YAML-declared flat keys were lost.
+
+    An explicit nested value always wins: flat keys only fill in what the nested
+    mapping does not already set.
+    """
+    flat = {
+        key: normalized[key]
+        for key in (f.name for f in fields(DiffusionParallelConfig))
+        if normalized.get(key) is not None
+    }
+    if not flat:
+        return
+
+    parallel_config = normalized.get("parallel_config")
+    if parallel_config is None:
+        nested: dict[str, Any] = {}
+    elif isinstance(parallel_config, Mapping):
+        nested = dict(parallel_config)
+    else:
+        # Already a DiffusionParallelConfig (or similar object): it is more
+        # specific than loose kwargs, so leave it untouched.
+        return
+
+    for key, value in flat.items():
+        nested.setdefault(key, value)
+    normalized["parallel_config"] = nested
+
+
 def normalize_omni_diffusion_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize legacy diffusion kwargs before config construction."""
     normalized = dict(kwargs)
+
+    _fold_flat_parallel_kwargs(normalized)
 
     # Backwards-compatibility: older callers may use a diffusion-specific
     # "static_lora_scale" kwarg. Normalize it to the canonical "lora_scale".

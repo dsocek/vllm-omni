@@ -26,18 +26,17 @@ dtype: bfloat16
 stages:
   # Stage 0: DiT (text encoder + transformer) -> latents.
   - stage_id: 0
-    devices: "0"
+    devices: "0,1"
     max_num_seqs: 1
     enforce_eager: true
     model_class_name: CausalForcingDiTPipeline
-    parallel_config:
-      tensor_parallel_size: 1
-    # Live CMAF streaming (work-item c): stream each rollout block out of the
-    # worker as it is produced (over result_mq, keeping RequestScheduler — no
-    # step execution). Harmless for the batch path; the dynamo worker only takes
-    # the per-chunk lane when non-terminal blocks arrive.
-    streaming_output: true
-    stream_dit_blocks: true
+    # NOTE: these are FLAT stage fields. _parse_stage_deploy reads them from the stage
+    # dict (or engine_args:); a nested block under a non-reserved key is silently
+    # dropped -- which is why the 2-card file appeared to set a TP size and did not.
+    #
+    # TP2, not TP3: dim=1536 and heads=12 divide by 3, but ffn_dim=8960 does not, and
+    # the RMSNorm shard check fires. 2 and 4 are clean.
+    tensor_parallel_size: 2
     # Session-scoped streaming. The registry has to live in the worker process
     # because CausalForcingStream owns device tensors (the KV window) that cannot be
     # serialized across the process boundary, and it has to outlive the request that
@@ -77,18 +76,34 @@ stages:
 
   # Stage 1: VAE decode -> pixels.
   - stage_id: 1
-    devices: "1"
+    devices: "2,3"
     max_num_seqs: 1
     enforce_eager: true
     model_class_name: CausalForcingVAEPipeline
-    parallel_config:
-      tensor_parallel_size: 1
-    # Live CMAF streaming (work-item c): stream each decoded pixel frame out of
-    # the VAE worker as it is produced (feat_cache persisted across frames →
-    # seam-free), symmetric to the DiT block-stream lane. The dynamo worker
-    # routes these final-stage pixel chunks to the router via per-chunk SHM.
-    streaming_output: true
-    stream_dit_blocks: true
+    # TP=2 here does NOT shard a transformer -- this stage builds none
+    # (CausalForcingVAEPipeline sets _dit_modules = []). It is what sizes the
+    # process group to 2 ranks, because world_size is a product of the DiT
+    # parallel degrees and vae_patch_parallel_size is deliberately not one of
+    # them: patch parallelism REUSES the DiT group rather than growing it
+    # (_get_world_rank_pp_size clamps to min(pp, world)). With
+    # tensor_parallel_size: 1 the world is 1 rank and PP=2 silently collapses to
+    # 1 -- which is exactly how the first 4-card attempt measured no speedup.
+    tensor_parallel_size: 2
+    # Spatial patch parallelism, NOT temporal pipelining. The Wan VAE decode threads
+    # _feat_map/_conv_idx from chunk N into chunk N+1, so putting consecutive chunks on
+    # different cards would decode against a stale cache -- seams, not just a slowdown.
+    # Splitting within a frame keeps temporal order intact.
+    # PP3 is avoided: world=3 hangs in halo exchange.
+    vae_patch_parallel_size: 2
+    # spatial_shard_height, not tile: a tile is a slice of the whole clip, so tiling
+    # can only run after the last latent frame exists -- which is exactly the wait the
+    # pipelined router is built to avoid. Height sharding divides a *single* frame
+    # across ranks, so it composes with the per-frame streaming decode: each rank keeps
+    # its own temporal cache for its own rows, and rank 0 gathers.
+    #
+    # 60 latent rows at 480p split 2 ways with no remainder. Height rather than width
+    # because 60 divides more cleanly than 104 across the decoder's upsamples.
+    vae_parallel_mode: spatial_shard_height
     # Same class, different half of the protocol: this stage has no rollout, so its
     # session is a decode cursor that keeps the VAE's temporal feat_cache alive across
     # chunks. That cache is what makes chunk boundaries seam-free, and because it
