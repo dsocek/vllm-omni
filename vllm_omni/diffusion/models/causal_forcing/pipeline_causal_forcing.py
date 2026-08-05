@@ -238,13 +238,31 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
             self._load_transformer_checkpoint(ckpt_path)
 
         if self._build_vae:
+            # The VAE follows the pipeline dtype (bf16 in every shipped config), not
+            # fp32. fp32 here costs 2.5x on the stage that bounds the whole pipeline:
+            # measured 1.119 s/latent fp32 vs 0.449 bf16 for one 480x832 latent on an
+            # Arc Pro B70. It is also not merely a slower path -- fp32 weights make
+            # OmniAutoencoderKLWan._execution_context() return nullcontext(), since it
+            # enables autocast only for fp16/bf16, so fp32 loading silently opted the
+            # decode out of autocast entirely.
+            #
+            # Quality cost is negligible and, importantly, does not compound: decoding
+            # the same 25 latents both ways gives 58.95 dB whole-clip PSNR with
+            # per-frame PSNR flat at 53-60 dB from the first frame to the 97th. That
+            # matters more than the average, because bf16 error entering the decoder's
+            # temporal `feat_cache` would otherwise accumulate chunk over chunk. 59 dB
+            # is well past the ~48 dB that quantising to 8-bit h264 imposes anyway.
+            #
+            # Set `dtype: float32` in the deploy YAML to restore the old behaviour;
+            # note that fp16 is a different question, since fp16 VAEs genuinely do
+            # overflow (max normal 65504) where bf16 keeps fp32's exponent range.
             self.vae = from_pretrained_with_prefetch(
                 DistributedAutoencoderKLWan.from_pretrained,
                 model,
                 subfolder="vae",
                 prefetch_list=component_subfolders,
                 local_files_only=local_files_only,
-                torch_dtype=torch.float32,
+                torch_dtype=self.dtype,
             ).to(self.device)
             self.register_buffer(
                 "vae_latents_mean",
