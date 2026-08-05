@@ -88,8 +88,33 @@ def dit2vae(
     if latents is None:
         logger.warning("[dit2vae] no latent tensor found on DiT-stage output; skipping request")
         return None
-    if not isinstance(latents, torch.Tensor):
-        latents = torch.as_tensor(latents)
+    # ``latents`` may be a single whole-clip tensor (aggregated / fetch-all) or a
+    # list of per-block tensors (incremental feed, §4.2 Step 1). Carry whichever
+    # shape through to the VAE stage untouched — the pipeline flattens and streams
+    # the blocks one frame at a time — and derive pixel geometry from the first
+    # block (all blocks share [B, C, *, H, W]; only the temporal extent differs).
+    if (first_block := getattr(latents, "first_block", None)) is not None:
+        # Live block stream (§4.2 Step 2): the upstream stage is still producing.
+        # Iterating here would block until the rollout finished and defeat the
+        # overlap, so pass the stream through untouched and take geometry from its
+        # peekable first block — all blocks share [B, C, *, H, W]. The total frame
+        # count is unknowable now; fall back to the request's own num_frames below
+        # (the real decode derives geometry from the latents, not from this).
+        geom = first_block
+        latent_frames = 0
+    elif isinstance(latents, (list, tuple)):
+        blocks = [b if isinstance(b, torch.Tensor) else torch.as_tensor(b) for b in latents]
+        if not blocks:
+            logger.warning("[dit2vae] empty latent block list on DiT-stage output; skipping request")
+            return None
+        latents = blocks
+        geom = blocks[0]
+        latent_frames = sum(int(b.shape[2]) for b in blocks)
+    else:
+        if not isinstance(latents, torch.Tensor):
+            latents = torch.as_tensor(latents)
+        geom = latents
+        latent_frames = int(latents.shape[2])
 
     # Original request prompt (carry through user-facing generation params).
     if isinstance(prompt, list):
@@ -106,13 +131,16 @@ def dit2vae(
 
     text_prompt = original_prompt.get("prompt", "")
     # Latent geometry -> pixel geometry (VAE upsamples 8x spatial, 4x temporal).
-    # latents: [B, C, latent_frames, latent_h, latent_w]
-    latent_frames = int(latents.shape[2])
-    latent_h = int(latents.shape[3])
-    latent_w = int(latents.shape[4])
+    # geom: [B, C, latent_frames, latent_h, latent_w] (first block when chunked).
+    latent_h = int(geom.shape[3])
+    latent_w = int(geom.shape[4])
     height = original_prompt.get("height") or latent_h * 8
     width = original_prompt.get("width") or latent_w * 8
-    num_frames = original_prompt.get("num_frames") or (latent_frames - 1) * 4 + 1
+    # latent_frames == 0 marks a live stream of unknown length: only the request's
+    # own num_frames is meaningful then (the count-based fallback needs the total).
+    num_frames = original_prompt.get("num_frames") or (
+        (latent_frames - 1) * 4 + 1 if latent_frames else 0
+    )
 
     vae_input: dict[str, Any] = {
         "prompt": text_prompt,
@@ -124,9 +152,19 @@ def dit2vae(
         "extra": {"latents": latents},
     }
 
+    if first_block is not None:
+        latents_desc = f"live-stream x{tuple(geom.shape)}"
+        source_desc = "live block stream (concurrent with upstream rollout)"
+    elif isinstance(latents, list):
+        latents_desc = f"{len(latents)}x{tuple(geom.shape)}"
+        source_desc = f"block-list ({len(latents)} blocks, no cat)"
+    else:
+        latents_desc = tuple(latents.shape)
+        source_desc = "single tensor"
+    logger.info("[cmaf-step2] dit2vae latent source: %s", source_desc)
     logger.info(
         "[dit2vae] latents=%s -> target=%dx%d frames=%d wall=%.3fms",
-        tuple(latents.shape),
+        latents_desc,
         vae_input["width"],
         vae_input["height"],
         vae_input["num_frames"],

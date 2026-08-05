@@ -427,6 +427,7 @@ class DiffusionEngine:
         matching the step-streaming delivery contract.
         """
         request_id = sched_output.scheduled_request_ids[0]
+        n_delivered = 0
         try:
             for runner_output in self.executor.execute_request_stream(sched_output):
                 self._process_aborts_queue()
@@ -435,9 +436,27 @@ class DiffusionEngine:
                     # Non-terminal block: deliver its result straight away.
                     if runner_output.result is not None:
                         self._put_streaming_output_with_cv(request_id, runner_output.result)
+                        n_delivered += 1
+                    else:
+                        # [cmaf-trace] A non-terminal reply with no result is
+                        # dropped here with no other trace, so name it.
+                        logger.info(
+                            "[cmaf-trace] engine: non-terminal reply for %s had "
+                            "result=None — nothing delivered",
+                            request_id,
+                        )
                     continue
                 # Terminal sentinel: let the scheduler mark the request finished,
                 # then flush the finished output (mirrors the step path).
+                # [cmaf-trace] This is the point of no return: once the scheduler
+                # finalizes, later frames have nowhere to go. Log the count that
+                # got through *before* finalizing, so an early terminal is obvious
+                # from the number alone.
+                logger.info(
+                    "[cmaf-trace] engine: TERMINAL for %s after delivering %d "
+                    "non-terminal chunks — finalizing request now",
+                    request_id, n_delivered,
+                )
                 finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
                 self._handle_step_streaming_runner_output(
                     finished_req_ids,
@@ -1001,6 +1020,18 @@ class DiffusionEngine:
         with self._cv:
             queue = self._out_queue_streaming.get(request_id)
         if queue is None:
+            # [cmaf-trace] The silent-drop path. The queue is popped once the
+            # consumer sees a terminal, so hitting this means an output was
+            # produced *after* the request was already finalized — exactly the
+            # symptom of an early terminal, and otherwise invisible.
+            logger.warning(
+                "[cmaf-trace] engine: DROPPED output for %s (finished=%s "
+                "chunk_index=%s) — no streaming queue; request was already "
+                "finalized and its queue popped",
+                request_id,
+                getattr(output, "finished", "?"),
+                getattr(output, "chunk_index", "?"),
+            )
             return
         self._put_streaming_queue_output(queue, output)
 

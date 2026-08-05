@@ -819,16 +819,38 @@ class WorkerProc:
 
     def return_result(self, output: Any):
         """Reply to client, only on rank 0."""
-        if self.result_mq is not None:
-            if isinstance(output, OmniACK):
-                self.result_mq.enqueue(output)
-                return
-            try:
-                pack_diffusion_output_shm(output)
-            except Exception as e:
-                if hasattr(output, "output"):
-                    logger.warning("SHM pack failed for model output: %s", e)
+        if self.result_mq is None:
+            # [cmaf-trace] A block-stream frame handed to a worker with no
+            # result_mq is silently discarded. That is correct for non-rank-0
+            # workers, but indistinguishable from a lost frame in a log, so say
+            # which case this is.
+            logger.info(
+                "[cmaf-trace] pid=%d return_result: NO result_mq (gpu_id=%s) — "
+                "output dropped (expected on non-rank-0)",
+                os.getpid(), getattr(self, "gpu_id", "?"),
+            )
+            return
+        if isinstance(output, OmniACK):
             self.result_mq.enqueue(output)
+            return
+        try:
+            pack_diffusion_output_shm(output)
+        except Exception as e:
+            if hasattr(output, "output"):
+                logger.warning("SHM pack failed for model output: %s", e)
+        # [cmaf-trace] The producer end of the streaming lane. Pairs with the
+        # executor's dequeue trace to prove whether a frame that was enqueued
+        # here actually arrived — the two are in different processes, so a gap
+        # between these two counts localizes the loss to the message queue.
+        logger.info(
+            "[cmaf-trace] pid=%d return_result: ENQUEUE finished=%s chunk_index=%s "
+            "output_is_none=%s",
+            os.getpid(),
+            getattr(output, "finished", "?"),
+            getattr(output, "chunk_index", "?"),
+            getattr(output, "output", "?") is None,
+        )
+        self.result_mq.enqueue(output)
 
     def recv_message(self):
         """Receive messages from broadcast queue."""
@@ -860,6 +882,14 @@ class WorkerProc:
         # only rank 0 streams; the terminal sentinel rides the normal reply below.
         if rpc_request.get("stream_blocks") and method == "execute_model":
             kwargs = {**kwargs, "on_block": self.return_result}
+            # [cmaf-trace] The switch that creates the streaming lane. If this line
+            # is absent for a stage that should stream, the pipeline runs the
+            # accumulate-everything path and no chunk is ever emitted.
+            logger.info(
+                "[cmaf-trace] pid=%d execute_rpc: stream_blocks lane ARMED "
+                "(on_block=return_result, result_mq=%s)",
+                os.getpid(), self.result_mq is not None,
+            )
 
         if collect_rank_status and not exec_all_ranks:
             raise ValueError("collect_rank_status requires exec_all_ranks=True so all ranks enter the status gather")

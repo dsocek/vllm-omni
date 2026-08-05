@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys as _sys
 from collections.abc import Iterable
 from typing import ClassVar
 
@@ -757,15 +758,101 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
                     "CausalForcingPipeline VAE stage received no latents; expected "
                     "prompt['extra']['latents'] (from dit2vae) or sampling extra_args['latents']."
                 )
-        if not isinstance(latents, torch.Tensor):
-            latents = torch.as_tensor(latents)
-        # Latents arrive host-side (CPU) across the stage boundary; place on the
-        # VAE device. [B, C, latent_frames, H, W].
-        latents = latents.to(device=self.device)
+
+        # Latents arrive either as one whole-clip tensor (aggregated / today's
+        # fetch-all path) or as a list of per-block tensors (incremental feed).
+        # Normalize to a flat list of per-latent-frame slices on the VAE device:
+        # the streaming decode below consumes it as an iterable and never reads
+        # its length, so one code path serves both a whole-clip tensor and a
+        # per-block list. Flattening to single frames preserves the aggregated
+        # path's one-emission-per-frame granularity exactly, and the per-frame
+        # decode sequence (hence the pixels) is identical either way.
+        # [B, C, latent_frames, H, W] per block; slices are [B, C, 1, H, W].
+        def _to_device(t):
+            if not isinstance(t, torch.Tensor):
+                t = torch.as_tensor(t)
+            return t.to(device=self.device)
+
+        if isinstance(latents, torch.Tensor):
+            raw_blocks = [latents]
+            source_desc = "1 whole-clip tensor"
+        elif isinstance(latents, (list, tuple)):
+            raw_blocks = latents
+            source_desc = f"{len(latents)} blocks"
+        else:
+            # A blocking iterable of blocks still being produced upstream (§4.2
+            # Step 2). Never call len() or list() on it: materializing would wait
+            # for the whole rollout and defeat the overlap this path exists for.
+            raw_blocks = latents
+            source_desc = "live block stream"
+
+        def _iter_frame_slices():
+            """Yield per-latent-frame slices lazily, one block at a time.
+
+            A generator (not a list) so a live stream is consumed as it arrives:
+            each block is split the moment it lands, decoded, and released. For a
+            list or a single tensor the emitted sequence is exactly the same, so
+            the two paths stay byte-identical.
+            """
+            import time as _t
+
+            _n_blocks = 0
+            _t_first = _t.perf_counter()
+            # Time the *wait* for each block explicitly. The blocking happens inside
+            # the iterator's __next__, so it has to be measured around the pull —
+            # not after it — which is why this drives the iterator by hand. A large
+            # wait means the decode is starved, i.e. the rollout is the bottleneck
+            # (the healthy steady state for a live stream); a small one means blocks
+            # are already queued and the decode is the bottleneck.
+            _it = iter(raw_blocks)
+            while True:
+                _t_wait = _t.perf_counter()
+                try:
+                    blk = next(_it)
+                except StopIteration:
+                    break
+                _waited_ms = (_t.perf_counter() - _t_wait) * 1000.0
+                blk = _to_device(blk)
+                _n_blocks += 1
+                logger.info(
+                    "[cmaf-step2] vae decode: block %d %s ready after %.0fms wait "
+                    "(+%.2fs since decode start)",
+                    _n_blocks - 1,
+                    tuple(blk.shape),
+                    _waited_ms,
+                    _t.perf_counter() - _t_first,
+                )
+                for i in range(blk.shape[2]):
+                    yield blk[:, :, i : i + 1]
+            logger.info(
+                "[cmaf-step2] vae decode: block source exhausted after %d blocks, %.2fs",
+                _n_blocks,
+                _t.perf_counter() - _t_first,
+            )
+
+        # [cmaf-trace] The three inputs that decide whether this decode streams at
+        # all. on_block=None accumulates every frame and emits nothing — visually
+        # identical in a log to a decode that ran and lost its frames — and
+        # output_type=="latent" returns below without ever decoding pixels. Both
+        # are silent mode downgrades, so record them at the entry point.
+        logger.info(
+            "[cmaf-step2] _forward_vae_decode input: %s (lazy iterable decode, no range(N))",
+            source_desc,
+        )
+        logger.info(
+            "[cmaf-trace] pid=%d vae: _forward_vae_decode ENTER — on_block=%s "
+            "output_type=%s stage_role=%s",
+            os.getpid(),
+            "SET (will stream)" if on_block is not None else "None (NO streaming)",
+            output_type,
+            self._stage_role,
+        )
 
         if output_type == "latent":
-            # Pass-through (debug / chaining): hand the latents straight out.
-            return DiffusionOutput(output=latents)
+            # Pass-through (debug / chaining): hand the latents straight out as
+            # one whole-clip tensor regardless of how the blocks arrived. This
+            # drains a live stream to completion by necessity.
+            return DiffusionOutput(output=torch.cat(list(_iter_frame_slices()), dim=2))
 
         import os as _os
 
@@ -784,36 +871,70 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
         if stream_decode:
             # Per-latent streaming decode, temporal cache persisted across
             # frames — seam-free, identical to the aggregated streaming path.
+            # The loop consumes the frame-slice generator and never reads a
+            # length: whether the source is a whole-clip tensor, a list of
+            # per-block tensors, or a live blocking stream still being produced
+            # upstream, the per-frame decode sequence is identical. On the live
+            # stream it simply blocks between blocks, so decode overlaps the
+            # upstream rollout (§4.2 Step 2) with no change to this loop body.
             self._decode_stream_begin()
-            num_latent_frames = latents.shape[2]
             decoded_chunks = []
-            for i in range(num_latent_frames):
-                pixels = self._decode_stream_step(latents[:, :, i : i + 1])
-                decoded_chunks.append(pixels)
+            num_latent_frames = 0
+            for i, latent_frame in enumerate(_iter_frame_slices()):
+                pixels = self._decode_stream_step(latent_frame)
+                num_latent_frames = i + 1
                 # VAE pixel-stream hook: emit this frame's pixels the moment they
                 # are decoded. The feat_cache carried by _decode_stream_step keeps
                 # the stream seam-free, so a streamed frame is byte-identical to
                 # its slice of the whole-clip output. finished=False marks it
                 # non-terminal (mirrors the DiT on_block lane).
                 if on_block is not None:
+                    # Streamed lane: this frame is already on its way out, so do
+                    # not also retain it — holding every frame would rebuild the
+                    # whole clip in memory for an output that is never returned.
+                    #
+                    # total_chunks: a live stream's length is genuinely unknown
+                    # here. The request-mode block-stream lane never reads it
+                    # (RequestScheduler decides terminality from the result alone,
+                    # and `request_denoise_completed` is a step-mode property), so
+                    # any value is inert on this path — but a sentinel keeps it
+                    # honest rather than asserting a count we do not have. The
+                    # explicit finished=True sentinel after this loop is the sole
+                    # terminal.
                     on_block(
                         DiffusionOutput(
                             output=pixels,
                             finished=False,
                             chunk_index=i,
-                            total_chunks=num_latent_frames,
+                            total_chunks=_sys.maxsize,
                         )
                     )
-            output = torch.cat(decoded_chunks, dim=2)
+                    logger.info(
+                        "[cmaf-trace] pid=%d vae: on_block returned for pixel frame "
+                        "%d (enqueued to result_mq)",
+                        os.getpid(), i,
+                    )
+                else:
+                    decoded_chunks.append(pixels)
+            output = torch.cat(decoded_chunks, dim=2) if decoded_chunks else None
             self._decode_stream_end()
             # Streamed lane: every frame already went out via on_block. Return a
             # bare terminal sentinel (no payload) so the consumer is not handed
             # the whole clip a second time — same contract as the DiT lane.
             if on_block is not None:
+                logger.info(
+                    "[cmaf-trace] pid=%d vae: decode loop DONE after %d frames; "
+                    "returning terminal finished=True sentinel",
+                    os.getpid(), num_latent_frames,
+                )
                 return DiffusionOutput(output=None, finished=True)
         else:
-            # Whole-clip decode (spatial-shard when vae_pp>1); denorm here.
-            _denormed = self._denorm_latents(latents)
+            # Whole-clip decode (spatial-shard when vae_pp>1); denorm here. Cat
+            # the per-frame slices back into one clip for the distributed decode.
+            # This path is inherently whole-clip, so it drains a live stream.
+            _whole_clip = torch.cat(list(_iter_frame_slices()), dim=2)
+            num_latent_frames = int(_whole_clip.shape[2])
+            _denormed = self._denorm_latents(_whole_clip)
             output = self.vae.decode(_denormed, return_dict=False)[0]
 
         if _cf_stage:
@@ -822,7 +943,7 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
             logger.info(
                 "[CF_STAGE] (vae-stage) vae_pp=%d latent_frames=%d VAE=%.1fms",
                 vae_pp,
-                latents.shape[2],
+                num_latent_frames,
                 _cf_vae_ms,
             )
 

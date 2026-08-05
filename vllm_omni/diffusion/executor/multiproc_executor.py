@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import multiprocessing.connection
+import os
 import threading
 import time
 import weakref
@@ -377,6 +378,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         }
         self._broadcast_mq.enqueue(rpc_request)
 
+        n_streamed = 0
         while True:
             response = self._dequeue_one_with_failure_polling(None, "execute_model")
             try:
@@ -387,6 +389,24 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if not isinstance(response, DiffusionOutput):
                 raise RuntimeError(f"Unexpected streamed response type: {type(response)!r}")
             finished = bool(response.finished)
+            # [cmaf-trace] Consumer end of the streaming lane, in the *engine*
+            # process. `finished` here is the sole thing that ends this drain and
+            # finalizes the request, so logging it per reply is what distinguishes
+            # "the pipeline stopped emitting" from "a reply arrived early with
+            # finished=True". Pairs with return_result's ENQUEUE trace: matching
+            # counts mean nothing was lost in the queue.
+            logger.info(
+                "[cmaf-trace] pid=%d executor: DEQUEUE #%d finished=%s chunk_index=%s "
+                "output_is_none=%s error=%s aborted=%s",
+                os.getpid(),
+                n_streamed,
+                finished,
+                response.chunk_index,
+                response.output is None,
+                response.error,
+                response.aborted,
+            )
+            n_streamed += 1
             yield RunnerOutput(
                 request_id=new_req.request_id,
                 step_index=None,
@@ -394,6 +414,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 result=response,
             )
             if finished:
+                logger.info(
+                    "[cmaf-trace] pid=%d executor: stream drain ENDED after %d replies "
+                    "(terminal finished=True)",
+                    os.getpid(), n_streamed,
+                )
                 break
 
     def execute_batch(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
