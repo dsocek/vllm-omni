@@ -94,6 +94,20 @@ STREAM_REBASE_AT = 768
 SCENE_SEED_STRIDE = 0x9E3779B1
 
 
+def _device_synchronize() -> None:
+    """Block until the active accelerator's queued work has finished.
+
+    Device-agnostic on purpose. The stage timers below need a real barrier or
+    they measure launch time instead of execution time, but a hardcoded
+    ``torch.xpu.synchronize()`` raises on a CUDA build, which made
+    ``CF_STAGE_TIMER=1`` unusable on NVIDIA. ``torch.accelerator`` dispatches to
+    whichever backend is active (xpu, cuda, ...), and is a no-op when there is
+    no accelerator at all, so a CPU run degrades to untimed rather than crashing.
+    """
+    if torch.accelerator.is_available():
+        torch.accelerator.synchronize()
+
+
 def _read_model_index(model: str) -> dict:
     """Read the assembled model's ``model_index.json`` inference constants.
 
@@ -808,10 +822,18 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
 
         _cf_stage = _os.environ.get("CF_STAGE_TIMER") == "1"
         _cf_dit_ms = 0.0
+        # Aggregated (role="full") inline-decode accounting. In this role the VAE
+        # decode of block N runs inside the rollout loop, between block N and
+        # block N+1, so the wall time the loop reports is DiT+VAE summed. Timing
+        # only the whole loop cannot show that; these two accumulators split it,
+        # which is what makes the sum-vs-max claim measurable on this path
+        # instead of merely asserted.
+        _cf_inline_vae_ms = 0.0
+        _cf_blocks_timed = 0
         if _cf_stage:
             import time as _time
 
-            torch.xpu.synchronize()
+            _device_synchronize()
             _cf_dit_t0 = _time.perf_counter()
         # Flatten the scene schedule to one entry per block, so the rollout loop stays a
         # single flat pass and only has to look up "which prompt does this block use".
@@ -879,7 +901,14 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
                 # Decode this chunk's latents now (streaming), carrying the VAE
                 # temporal cache forward so output is seam-free across chunks.
                 if stream_decode:
+                    if _cf_stage:
+                        _device_synchronize()
+                        _cf_v0 = _time.perf_counter()
                     decoded_chunks.append(self._decode_stream_step(denoised_pred))
+                    if _cf_stage:
+                        _device_synchronize()
+                        _cf_inline_vae_ms += (_time.perf_counter() - _cf_v0) * 1000.0
+                        _cf_blocks_timed += 1
 
                 # DiT block-stream hook: emit this block's latents now.
                 # ``_rollout_block`` has already done the clean-context refresh,
@@ -902,7 +931,7 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
                 progress_bar.update()
 
         if _cf_stage:
-            torch.xpu.synchronize()
+            _device_synchronize()
             _cf_dit_ms = (_time.perf_counter() - _cf_dit_t0) * 1000.0
         logger.info(
             "[CF_PATH] role=%s output_type=%s stream_decode=%s vae_pp=%s n_latents=%d",
@@ -933,6 +962,33 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
             # Concatenate the per-chunk streaming-decoded video along the time axis.
             output = self._concat_stream_chunks(decoded_chunks)  # [B, C, T_video, H, W]
             self._decode_stream_end()
+            if _cf_stage:
+                # The aggregated path's only stage log. _cf_dit_ms covers the whole
+                # rollout loop, and the inline decodes happened INSIDE it, so DiT
+                # proper is the difference -- reported that way rather than as two
+                # independent measurements because the loop is what the client
+                # actually waits on. serial_total is the sum the aggregated
+                # topology pays; max() is the floor a disaggregated one could
+                # reach by overlapping the two stages on separate devices.
+                _cf_dit_only_ms = _cf_dit_ms - _cf_inline_vae_ms
+                _n = max(_cf_blocks_timed, 1)
+                logger.info(
+                    "[CF_STAGE] (aggregated, inline decode) blocks=%d "
+                    "DiT=%.1fms VAE=%.1fms serial_total=%.1fms "
+                    "per_block: DiT=%.1fms VAE=%.1fms sum=%.1fms max=%.1fms "
+                    "=> ideal_disagg_speedup=%.2fx",
+                    _cf_blocks_timed,
+                    _cf_dit_only_ms,
+                    _cf_inline_vae_ms,
+                    _cf_dit_ms,
+                    _cf_dit_only_ms / _n,
+                    _cf_inline_vae_ms / _n,
+                    _cf_dit_ms / _n,
+                    max(_cf_dit_only_ms, _cf_inline_vae_ms) / _n,
+                    (_cf_dit_ms / max(_cf_dit_only_ms, _cf_inline_vae_ms))
+                    if max(_cf_dit_only_ms, _cf_inline_vae_ms) > 0
+                    else float("nan"),
+                )
         else:
             # Patch/tile-parallel path: single distributed whole-clip decode.
             video_latents = torch.cat(denoised_latents, dim=2)
@@ -952,11 +1008,11 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
                 except Exception as _e:
                     logger.warning("[CF_DUMP] failed: %s", _e)
             if _cf_stage:
-                torch.xpu.synchronize()
+                _device_synchronize()
                 _cf_vae_t0 = _time.perf_counter()
             output = self.vae.decode(_denormed, return_dict=False)[0]
             if _cf_stage:
-                torch.xpu.synchronize()
+                _device_synchronize()
                 _cf_vae_ms = (_time.perf_counter() - _cf_vae_t0) * 1000.0
                 logger.info(
                     "[CF_STAGE] vae_pp=%d latents=%d DiT=%.1fms VAE=%.1fms DiT+VAE=%.1fms",
@@ -1051,7 +1107,7 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
         if _cf_stage:
             import time as _time
 
-            torch.xpu.synchronize()
+            _device_synchronize()
             _cf_vae_t0 = _time.perf_counter()
 
         if stream_decode:
@@ -1095,7 +1151,7 @@ class CausalForcingPipeline(nn.Module, ProgressBarMixin, SupportsComponentDiscov
             output = self.vae.decode(_denormed, return_dict=False)[0]
 
         if _cf_stage:
-            torch.xpu.synchronize()
+            _device_synchronize()
             _cf_vae_ms = (_time.perf_counter() - _cf_vae_t0) * 1000.0
             logger.info(
                 "[CF_STAGE] (vae-stage) vae_pp=%d latent_frames=%d VAE=%.1fms",

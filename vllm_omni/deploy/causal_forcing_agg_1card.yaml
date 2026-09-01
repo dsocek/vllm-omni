@@ -1,0 +1,87 @@
+# Causal-Forcing (framewise-1step) AGGREGATED T2V deploy: 1 stage, 1 card.
+#
+# This is the BASELINE for the disaggregation measurement (vllm-omni#4590). One
+# worker owns the whole end-to-end pipeline -- text encode, framewise rollout,
+# and VAE decode -- on a single device, which is what "aggregated" means here.
+#
+# The point of comparison is causal_forcing_disagg.yaml. Everything below that
+# is not inherently about aggregation is deliberately copied from that file, so
+# the difference the run measures is the topology and not an incidental config
+# delta:
+#
+#   * same model_config (num_frame_per_block, denoising lists, checkpoint)
+#   * same default_sampling_params, so nvext overrides are applied rather than
+#     dropped (_build_sampling_params returns None when it is empty)
+#   * same local_attn_size: 21 -- the disagg DiT stage's value, NOT the -1 that
+#     causal_forcing.yaml carries. At 480x832 these are the same 21-frame
+#     attention span (global attention is itself capped by its 32760-token pool
+#     = 21 * 1560 tokens/frame), so this is not a quality change; it just keeps
+#     the KV pool sizing identical on both sides of the comparison.
+#
+# The `pipeline:` key is REQUIRED, and causal_forcing.yaml's lack of one is why
+# it cannot be served by Dynamo at all. Without it the single-stage resolution
+# falls to _create_default_diffusion_stage_cfg, which lives in vllm-omni's own
+# offline engine and is only reached when the caller passes
+# default_stage_cfg_factory -- Dynamo's resolver does not. The result is a
+# silent 0 stages and "--stage-id 0 out of range (YAML has 0 stages)". See
+# vllm_omni/model_executor/models/causal_forcing/pipeline.py.
+#
+# Devices are LOGICAL indices into the launching process's visible set, so
+# devices:"0" is the first RESERVED card, not physical card 0. Launch masked to
+# the cards you own (CUDA_VISIBLE_DEVICES / ZE_AFFINITY_MASK) and nothing else
+# is touched.
+
+pipeline: causal_forcing_agg
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  # Stage 0: the entire pipeline -- DiT rollout AND VAE decode, one worker.
+  #
+  # In this role (_stage_role="full") CausalForcingPipeline.forward decodes each
+  # block inside the rollout loop: DiT block N, VAE block N, DiT block N+1, ...
+  # So the per-block cost is T_dit + T_vae by construction. That serialization
+  # is precisely what the disaggregated topology converts into
+  # max(T_dit, T_vae) by putting the two stages on separate devices and letting
+  # them overlap -- it is the effect under test, not a limitation to work around.
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: CausalForcingPipeline
+    parallel_config:
+      tensor_parallel_size: 1
+    # Both routes are served from this one stage, so both sets of flags are here.
+    #
+    # One-shot requests (no cf_session) take the batch path: the worker returns a
+    # finished clip and the router fragments it into the same CMAF wire format
+    # (stage_router._format_output, cmaf_enabled).
+    #
+    # `cf_session=` requests take the pipelined lane, which an aggregated deploy
+    # can serve because session_drain on the "full" role decodes inline and
+    # returns pixels -- byte-identical to what session_decode_step returns on a
+    # VAE stage -- so they reach the router on the same (stage -> router)
+    # connector edge with no second hop. That is what makes multi-scene
+    # storyboards and live CMAF streaming work here, and it needs the registry to
+    # live in the worker process: CausalForcingStream owns the KV window as
+    # device tensors, which cannot be serialized across the process boundary and
+    # must outlive the request that created it. Only allocates on session_open.
+    streaming_output: true
+    stream_dit_blocks: true
+    worker_extension_cls: vllm_omni.diffusion.models.causal_forcing.session_extension.CausalForcingSessionExtension
+    default_sampling_params:
+      num_inference_steps: 1
+      num_frames: 81
+      height: 480
+      width: 832
+      fps: 16
+      seed: 42
+    model_config:
+      num_frame_per_block: 1
+      context_noise: 0
+      timestep_shift: 5.0
+      local_attn_size: 21
+      denoising_step_list: [1000]
+      denoising_step_list_first_chunk: [1000, 750, 500, 250]
+      transformer_checkpoint: framewise-1step.pt

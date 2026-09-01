@@ -19,6 +19,7 @@ import yaml
 from vllm_omni.diffusion.models.causal_forcing.session_extension import (
     CausalForcingSessionError,
     CausalForcingSessionExtension,
+    _default_max_sessions,
 )
 
 
@@ -249,6 +250,76 @@ def test_capacity_limit_is_raisable(dit):
     dit.session_open("s1", max_sessions=2)
     dit.session_open("s2", max_sessions=2)
     assert dit.session_info()["open_sessions"] == 2
+
+
+# -- why the two roles cap differently --------------------------------------
+#
+# On the DiT each session owns its own KV window, so the cap is a *memory* bound and
+# raising it is a legitimate tuning decision -- that is what lets one DiT feed several
+# VAE replicas at once. On the VAE the pipeline's feat_cache is per-module rather than
+# per-session, so two decode cursors in one process interleave into each other's
+# temporal context and emit a seam with nothing in the output to say so. That cap is a
+# *correctness* bound and must not be raisable, however the caller asks.
+
+
+def test_the_vae_role_refuses_to_raise_its_limit(vae):
+    """The bug this prevents: max_sessions=N on the VAE would be accepted, two cursors
+    would share one feat_cache, and the only symptom would be a seam in the video."""
+    vae.session_open("s1", max_sessions=4)
+    with pytest.raises(CausalForcingSessionError, match="session limit"):
+        vae.session_open("s2", max_sessions=4)
+    assert vae.session_info()["open_sessions"] == 1
+
+
+def test_the_vae_limit_points_at_replicas_as_the_way_out(vae):
+    """Scaling the VAE means more worker processes, not more sessions per process. The
+    message has to say so, or the next reader raises max_sessions and gets the seam."""
+    vae.session_open("s1")
+    with pytest.raises(CausalForcingSessionError, match="feat_cache"):
+        vae.session_open("s2")
+    with pytest.raises(CausalForcingSessionError, match="replicas"):
+        vae.session_open("s2")
+
+
+def test_the_dit_limit_points_at_the_env_knob(dit):
+    """The failure this exists for: a 4-replica VAE stalled at one concurrent request
+    because the DiT refused the second session, and the message did not say what to
+    change."""
+    dit.session_open("s1")
+    with pytest.raises(CausalForcingSessionError, match="CF_MAX_SESSIONS"):
+        dit.session_open("s2")
+
+
+def test_the_limit_message_names_the_role(dit, vae):
+    """Both roles raise the same exception type from the same call, so the role has to
+    be in the text -- otherwise a hetero deployment cannot tell which host refused."""
+    dit.session_open("s1")
+    vae.session_open("s1")
+    with pytest.raises(CausalForcingSessionError, match="dit session limit"):
+        dit.session_open("s2")
+    with pytest.raises(CausalForcingSessionError, match="vae session limit"):
+        vae.session_open("s2")
+
+
+# -- the CF_MAX_SESSIONS default --------------------------------------------
+
+
+def test_cf_max_sessions_sets_the_default(monkeypatch):
+    monkeypatch.setenv("CF_MAX_SESSIONS", "4")
+    assert _default_max_sessions() == 4
+
+
+def test_an_unset_cf_max_sessions_stays_at_one(monkeypatch):
+    monkeypatch.delenv("CF_MAX_SESSIONS", raising=False)
+    assert _default_max_sessions() == 1
+
+
+@pytest.mark.parametrize("raw", ["", "  ", "four", "2.5", "0", "-1"], ids=repr)
+def test_a_useless_cf_max_sessions_falls_back_to_one(monkeypatch, raw):
+    """A typo here must not silently admit unbounded sessions and OOM the card, nor
+    read as zero and refuse every request. Both directions land on the safe default."""
+    monkeypatch.setenv("CF_MAX_SESSIONS", raw)
+    assert _default_max_sessions() == 1
 
 
 def test_empty_session_id_rejected(dit):

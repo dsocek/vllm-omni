@@ -44,8 +44,15 @@ worker plays is a property of the pipeline it loaded, not of the extension:
 
 One consequence worth stating plainly: the VAE's ``feat_cache`` lives on the VAE
 module itself, not per-session, so a decoding session is necessarily **exclusive**
-on its worker. That is why ``DEFAULT_MAX_SESSIONS`` is 1 rather than a tuning knob
-that happens to be set low.
+on its worker. On that role the ceiling of 1 is a *correctness* bound, not a tuning
+knob set low, and ``session_open`` clamps to it regardless of what the caller asks
+for. Scaling the VAE out means more replicas -- each its own process, hence its own
+``feat_cache`` -- not a bigger ceiling.
+
+The DiT role is the opposite case: every session there owns its own
+``CausalForcingStream`` and KV window, so the ceiling is a *memory* bound and a card
+with room can hold several at once. That is what lets one DiT feed several VAE
+replicas concurrently, so it is settable -- see ``CF_MAX_SESSIONS``.
 
 A mis-routed call is a hard error, never a silently-started fresh stream. For an
 LLM a routing miss costs prefix-cache reuse; here the KV window is the only copy
@@ -55,6 +62,7 @@ visibly broken video instead of failing.
 
 from __future__ import annotations
 
+import os
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -70,7 +78,46 @@ logger = init_logger(__name__)
 # A session pins a KV window (~16 GB at 480x832) and its DiT+VAE pair for as long
 # as it is open, so an abandoned one is expensive. Callers that want a different
 # ceiling pass max_sessions to session_open.
-DEFAULT_MAX_SESSIONS = 1
+#
+# Settable because on the DiT role this is a memory bound, and one DiT can only feed
+# N VAE replicas concurrently if it will hold N sessions at once -- with the default
+# of 1, a second concurrent stream is refused at session_open and scene parallelism
+# is unreachable no matter how many VAE replicas are deployed.
+#
+# It stays 1 by default because the safe value depends on the card: at ~16 GB per KV
+# window, an 80 GB card holds about 4 alongside weights, and overcommitting shows up
+# as an OOM mid-rollout rather than a clean refusal. Set it deliberately, per host.
+#
+# The VAE role IGNORES this -- see session_open, where the cap resolves per role, and
+# the module docstring for why 1 is a correctness bound there.
+_MAX_SESSIONS_ENV = "CF_MAX_SESSIONS"
+
+
+def _default_max_sessions() -> int:
+    """Read the DiT-role session ceiling from the environment, defaulting to 1."""
+    raw = os.environ.get(_MAX_SESSIONS_ENV, "").strip()
+    if not raw:
+        return 1
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "[CF_SESSION] ignoring %s=%r: not an integer; using 1",
+            _MAX_SESSIONS_ENV,
+            raw,
+        )
+        return 1
+    if value < 1:
+        logger.warning(
+            "[CF_SESSION] ignoring %s=%d: must be >= 1; using 1",
+            _MAX_SESSIONS_ENV,
+            value,
+        )
+        return 1
+    return value
+
+
+DEFAULT_MAX_SESSIONS = _default_max_sessions()
 
 # Sessions idle longer than this expire on the next registry touch. A stream
 # has no connection to watch, so time since last use is the only liveness signal
@@ -274,15 +321,40 @@ class CausalForcingSessionExtension:
                 "Close it before reopening, or push scenes onto the existing session."
             )
 
-        if len(self._sessions) >= max_sessions:
-            raise CausalForcingSessionError(
-                f"Worker is at its session limit ({len(self._sessions)}/{max_sessions}). "
-                f"Open sessions: {sorted(self._sessions)}. Each session pins a KV window "
-                "and its DiT+VAE pair, so capacity is per-card, not per-request."
-            )
-
         pipeline = self._pipeline()
         role = getattr(pipeline, "_stage_role", "full")
+
+        # The ceiling means two different things per role, so it resolves per role.
+        #
+        # On the VAE role it is a CORRECTNESS bound and the caller does not get a
+        # vote: feat_cache lives on the VAE module rather than on the session, so a
+        # second concurrent decode cursor would interleave into the first one's
+        # temporal context and emit seams with nothing in the output to say so.
+        # Capacity there is added by running more replicas, each its own process.
+        #
+        # On the DiT role each session owns a separate CausalForcingStream and KV
+        # window, so the bound is only memory and several may be open at once. That
+        # is what lets one DiT feed several VAE replicas concurrently.
+        if role == "vae":
+            effective_max = 1
+            limit_reason = (
+                "the VAE's feat_cache is per-module, not per-session, so one decode "
+                "cursor per worker process is the only safe value; add VAE replicas "
+                "to decode more streams at once"
+            )
+        else:
+            effective_max = max_sessions
+            limit_reason = (
+                f"each session pins its own KV window, so this is a memory bound; "
+                f"raise {_MAX_SESSIONS_ENV} if the card has room"
+            )
+
+        if len(self._sessions) >= effective_max:
+            raise CausalForcingSessionError(
+                f"Worker is at its {role} session limit "
+                f"({len(self._sessions)}/{effective_max}). "
+                f"Open sessions: {sorted(self._sessions)}. {limit_reason}."
+            )
 
         info: dict[str, Any] = {
             "session_id": session_id,
@@ -420,9 +492,23 @@ class CausalForcingSessionExtension:
             )
         pipeline = self._require_role("session_decode_step", "vae", "full")
         session.touch()
+        # Timed so that the pure device cost can be compared against the caller's
+        # round trip (see [CF_BLOCK_TIME] in stage_worker). The two differing by
+        # much means the time is going to the RPC path, not to the cards, and that
+        # distinction has already been got wrong once here.
+        t0 = time.monotonic()
         video = pipeline._decode_stream_step(latents)
+        decode_ms = (time.monotonic() - t0) * 1e3
         session.chunks_decoded += 1
         session.touch()
+        logger.info(
+            "[CF_DECODE_TIME] %s chunk=%d decode=%.0fms latents=%s out=%s",
+            session_id,
+            session.chunks_decoded,
+            decode_ms,
+            tuple(latents.shape) if hasattr(latents, "shape") else "?",
+            tuple(video.shape) if hasattr(video, "shape") else "?",
+        )
         return video
 
     def session_close(self, session_id: str, *, missing_ok: bool = False) -> dict[str, Any]:

@@ -39,6 +39,19 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _device_synchronize() -> None:
+    """Block until the active accelerator's queued work has finished.
+
+    Device-agnostic: the CF_VAE_TIMER barriers below must not assume a backend.
+    A hardcoded ``torch.xpu.synchronize()`` raises on a CUDA build, so it made
+    the timer unusable on NVIDIA even though this decode path is shared.
+    ``torch.accelerator`` dispatches to whichever backend is active, and is a
+    no-op without one, so a CPU run degrades to untimed rather than crashing.
+    """
+    if torch.accelerator.is_available():
+        torch.accelerator.synchronize()
+
+
 @dataclass(frozen=True)
 class SpatialShardContext:
     input_extent: int
@@ -789,7 +802,7 @@ def spatial_shard_decode(
     _cf_timer = os.environ.get("CF_VAE_TIMER") == "1"
     if _cf_timer and rank == 0:
         logger.info("[CF_MARKER] spatial_shard_decode ENTER z=%s world=%d", tuple(z.shape), world_size)
-        torch.xpu.synchronize()
+        _device_synchronize()
         _cf_t0 = time.perf_counter()
     vae.clear_cache()
     try:
@@ -819,7 +832,7 @@ def spatial_shard_decode(
         vae.clear_cache()
 
     if _cf_timer and rank == 0:
-        torch.xpu.synchronize()
+        _device_synchronize()
         logger.info(
             "[CF_VAE_TIMER] spatial_shard_decode: %.1f ms (world=%d, latent_frames=%d, split=%s)",
             (time.perf_counter() - _cf_t0) * 1000,
